@@ -301,6 +301,46 @@ fn project(
         }
     }
     descriptor.insert("raw".into(), Value::Object(raw));
+    let mut efforts = None;
+    for (key, nested) in [
+        ("reasoning_levels", false),
+        ("supported_reasoning_levels", true),
+    ] {
+        if let Some(value) = item.get(key) {
+            let invalid = || failure(format!("Invalid remote model {key}"));
+            let values = value.as_array().ok_or_else(invalid)?;
+            let options = values
+                .iter()
+                .map(|value| {
+                    let value = if nested {
+                        value.get("effort")
+                    } else {
+                        Some(value)
+                    };
+                    value
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty() && *value == value.trim())
+                        .map(|value| Value::String(value.into()))
+                        .ok_or_else(invalid)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            efforts.get_or_insert(options);
+        }
+    }
+    if let Some(efforts) = efforts {
+        let mut reasoning = match descriptor.remove("reasoning") {
+            Some(Value::Object(value)) => value,
+            Some(Value::Bool(supported)) => {
+                serde_json::Map::from_iter([("supported".into(), Value::Bool(supported))])
+            }
+            None => serde_json::Map::new(),
+            _ => return Err(failure("Invalid remote model reasoning")),
+        };
+        if !reasoning.contains_key("effortOptions") && !reasoning.contains_key("effort_options") {
+            reasoning.insert("effortOptions".into(), Value::Array(efforts));
+        }
+        descriptor.insert("reasoning".into(), Value::Object(reasoning));
+    }
     for (target, sources) in [
         ("displayName", &["display_name", "displayName", "name"][..]),
         ("toolCalling", &["toolCalling", "toolCall", "tool_call"][..]),

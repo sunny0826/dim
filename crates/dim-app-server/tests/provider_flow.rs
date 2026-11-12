@@ -2118,6 +2118,191 @@ async fn modality_connection_resolution_reaches_the_stub_and_refuses_unselectabl
 }
 
 #[tokio::test]
+async fn remote_reasoning_levels_drive_preferences_and_survive_storage() {
+    let items = json!([
+        {"id":"magpie-flat","reasoning":true,"reasoning_levels":["low","high"],"supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}]},
+        {"id":"magpie-objects","supported_reasoning_levels":[{"effort":"high"}]},
+        {"id":"openai/gpt-5-nano","reasoning":true,"reasoning_levels":[],"supported_reasoning_levels":[]},
+        {"id":"openai/gpt-5-mini","reasoning":true},
+        {"id":"magpie-disabled","reasoning":false,"reasoning_levels":["high"]},
+        {"id":"magpie-canonical","reasoning":{"supported":true,"effortOptions":[]},"reasoning_levels":["high"]},
+        {"id":"magpie-snake","reasoning":{"supported":true,"effort_options":["high"]},"reasoning_levels":["low"]},
+        {"id":"magpie-priority","reasoning_levels":["high"],"supported_reasoning_levels":[{"effort":"low"}],"reasoning_options":[{"type":"effort","values":["max"]}]}
+    ]);
+    let mut listing = items.clone();
+    for item in listing.as_array_mut().unwrap() {
+        item["context_window"] = json!(32000);
+        item["max_output_tokens"] = json!(512);
+    }
+    let response = Arc::new(Mutex::new(json!({"data":listing})));
+    let body = response.clone();
+    let app = Router::new().route(
+        "/v1/models",
+        axum::routing::get(move || {
+            let value = body.lock().unwrap().clone();
+            async move { Json(value) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let home = std::env::temp_dir().join(format!("provider-reasoning-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).unwrap();
+    let home = home.canonicalize().unwrap();
+    let root = Ctx::root().unwrap();
+    root.plugin(
+        dim_app_server::methods::ManagementMethodsPlugin::typed(&dim_app_server::catalog())
+            .unwrap(),
+    );
+    root.plugin(FileStoragePlugin::new(vec![home.clone()]));
+    root.plugin(SqliteStoragePlugin::new(home.join("native.sqlite")));
+    root.plugin(ManagedProvidersPlugin);
+    root.plugin(dim_app_server::codex_oauth::OpenAICodexOAuthPlugin::new(&names(), 0).unwrap());
+    root.plugin(dim_app_server::grok_oauth::GrokOAuthPlugin::new(&names(), 0).unwrap());
+    root.plugin(dim_agent_aimux::AimuxPlugin);
+    let view = root.plugin(provider_part(ProviderPlugin::new));
+    tokio::time::timeout(std::time::Duration::from_secs(30), active(&view))
+        .await
+        .unwrap();
+    let provider = root.get::<ProviderService>().unwrap();
+    let cancel = CancellationToken::new();
+    let mut config = input(REMOTE, &base, StaticAuth::Anonymous, None, "reasoning", 512);
+    config.models.clear();
+    provider.create(config, &cancel).await.unwrap();
+    let refreshed = provider.refresh_for(REMOTE.into(), &cancel).await.unwrap();
+    let catalog = provider
+        .catalog_for(REMOTE.into(), &cancel)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(catalog.version, refreshed.version);
+    let record = stored_record(&home, REMOTE);
+    let bundled = BundledCatalog::load().unwrap();
+    for (id, supported, options) in [
+        ("magpie-flat", true, vec!["low", "high"]),
+        ("magpie-objects", true, vec!["high"]),
+        ("openai/gpt-5-nano", true, vec![]),
+        (
+            "openai/gpt-5-mini",
+            true,
+            vec!["minimal", "low", "medium", "high"],
+        ),
+        ("magpie-disabled", false, vec!["high"]),
+        ("magpie-canonical", true, vec![]),
+        ("magpie-snake", true, vec!["high"]),
+        ("magpie-priority", true, vec!["high"]),
+    ] {
+        let entry = catalog.models.iter().find(|entry| entry.id == id).unwrap();
+        let metadata = entry.metadata.as_ref().unwrap();
+        let reasoning = metadata.reasoning.as_ref().unwrap();
+        assert_eq!(reasoning.supported, supported, "{id}");
+        assert_eq!(reasoning.effort_options.as_ref().unwrap(), &options, "{id}");
+        let original = items
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["id"] == id)
+            .unwrap();
+        for (key, value) in original.as_object().unwrap() {
+            assert_eq!(&metadata.raw[key], value, "{id}: {key}");
+        }
+        for effort in ["high", "unlisted"] {
+            let selection = provider
+                .configuration(
+                    Some(ModelId {
+                        provider_id: REMOTE.into(),
+                        model_id: id.into(),
+                    }),
+                    None,
+                    ModelPreferences {
+                        reasoning_effort: Some(effort.into()),
+                        ..Default::default()
+                    },
+                    &cancel,
+                )
+                .await;
+            if supported && options.contains(&effort) {
+                let selection = selection.unwrap();
+                assert_eq!(
+                    selection
+                        .config
+                        .as_ref()
+                        .unwrap()
+                        .reasoning
+                        .as_ref()
+                        .unwrap()
+                        .effort
+                        .as_deref(),
+                    Some(effort)
+                );
+                let stored = stored_selection(&bundled, REMOTE, &record, id).unwrap();
+                assert_eq!(
+                    Some(&stored.snapshot),
+                    selection.capability_snapshot.as_ref()
+                );
+            } else {
+                assert!(selection.is_err(), "{id}: {effort}");
+            }
+        }
+    }
+    let empty = stored_selection(&bundled, REMOTE, &record, "openai/gpt-5-nano").unwrap();
+    let empty = serde_json::to_value(empty.snapshot).unwrap();
+    assert_eq!(empty["reasoning"]["effortOptions"], json!([]));
+    let defaults = provider
+        .configuration(
+            Some(ModelId {
+                provider_id: REMOTE.into(),
+                model_id: "openai/gpt-5-nano".into(),
+            }),
+            None,
+            ModelPreferences::default(),
+            &cancel,
+        )
+        .await
+        .unwrap();
+    assert!(
+        defaults
+            .config
+            .as_ref()
+            .and_then(|config| config.reasoning.as_ref())
+            .and_then(|reasoning| reasoning.effort.as_ref())
+            .is_none()
+    );
+    for invalid in [
+        json!({"reasoning_levels":null}),
+        json!({"reasoning_levels":"high"}),
+        json!({"reasoning_levels":[2]}),
+        json!({"reasoning_levels":[""]}),
+        json!({"reasoning_levels":[" high "]}),
+        json!({"supported_reasoning_levels":null}),
+        json!({"supported_reasoning_levels":["high"]}),
+        json!({"supported_reasoning_levels":[{}]}),
+        json!({"supported_reasoning_levels":[{"effort":false}]}),
+        json!({"reasoning_levels":["high"],"supported_reasoning_levels":false}),
+    ] {
+        let mut item = invalid.clone();
+        item["id"] = json!("invalid");
+        *response.lock().unwrap() = json!({"data":[{"id":"valid-first"},item]});
+        assert!(
+            provider.refresh_for(REMOTE.into(), &cancel).await.is_err(),
+            "{invalid}"
+        );
+        let after = provider
+            .catalog_for(REMOTE.into(), &cancel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(&catalog).unwrap()
+        );
+    }
+    root.shutdown().await.unwrap();
+    server.abort();
+    std::fs::remove_dir_all(home).unwrap();
+}
+
+#[tokio::test]
 async fn remote_catalog_refresh_preserves_edits_and_rejects_stale_or_partial_results() {
     use axum::{
         http::{StatusCode, Uri},

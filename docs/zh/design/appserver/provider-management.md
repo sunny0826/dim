@@ -184,6 +184,17 @@ models.reset 恢复仍存在的默认项，用户项用 delete。refresh 保留�
 和禁用项一起清空；同账号 refresh 则保留它们。托管账号目录不通过这些方法新增用户模型/路由。
 静态提供方只要已保存凭据或使用匿名认证，且驱动和定义都支持远端发现，就可以显式刷新。
 禁用的提供方刷新后仍保持禁用，模型仍不可用于执行。
+
+远端模型列表可以用 `reasoning_levels`（字符串数组）或 `supported_reasoning_levels`
+（含 `effort` 字符串的对象数组）声明推理档位。Provider 验证所有存在的数组；每个档位应为
+非空字符串，且首尾不得有空白。声明无效时，Provider 拒绝整个列表，不替换已保存的目录。
+Provider 在 `metadata.raw` 中保留原始声明。
+已有的 `reasoning.effortOptions` 或 `reasoning.effort_options` 优先。
+否则，`reasoning_levels` 优先于 `supported_reasoning_levels`，两者都优先于 `reasoning_options`。
+显式空数组阻止捆绑目录补充档位；缺少声明时保留捆绑目录回退。
+显式 `reasoning: false` 仍禁用推理；独立的推理关闭声明保持原有含义。
+已有目录需要显式刷新才会导入这些声明。已有 Session 在采用模型后使用新声明，见 §6。
+
 models.edit 修改用户模型的 descriptor 时替换该项 userModels，不把用户 ID 写入 modelConfigOverrides。
 models.set_enabled 接受默认模型及用户模型的 ID，并给出账号可用的完整集合：不对应任何目录项的
 ID 被拒绝，不可用项保持原有启用状态。这些操作从同一记录更新有效目录和路由，

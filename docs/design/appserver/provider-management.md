@@ -281,6 +281,21 @@ For a static Provider with a saved credential or anonymous authentication,
 explicit refresh is available whenever its driver and definition support remote
 listing. A disabled Provider stays disabled after refresh, and its models remain
 unavailable for execution.
+
+Remote model listings can declare effort choices with `reasoning_levels` (strings)
+or `supported_reasoning_levels` (objects with an `effort` string). Provider validates
+both arrays when present; each effort must be nonempty and have no surrounding
+whitespace. Invalid declarations reject the whole listing without replacing the
+stored catalog. Provider keeps the original declaration in `metadata.raw`.
+Existing `reasoning.effortOptions` or `reasoning.effort_options` takes precedence.
+Otherwise, `reasoning_levels` takes precedence over `supported_reasoning_levels`,
+and either takes precedence over `reasoning_options`. An explicit empty array
+prevents bundled effort choices from filling the list. Missing declarations keep
+the bundled fallback. Explicit `reasoning: false` still disables reasoning;
+independent reasoning-off declarations keep their existing meaning.
+Existing catalogs require an explicit refresh to import these declarations.
+Existing Sessions use them after model adoption, as described in §6.
+
 Descriptor edits to a user model replace that model's `userModels` entry; they
 never write the user ID into `modelConfigOverrides`. `models.set_enabled` accepts IDs
 from both defaults and user models and names the complete set the account can use:
